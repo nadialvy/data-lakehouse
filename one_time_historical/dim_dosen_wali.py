@@ -54,7 +54,20 @@ def transform_dosen_wali(df):
 # === LOAD ===
 def load_table(df, table_name):
     print(f"Loading {table_name}...")
-    df.to_sql(table_name, target_engine, if_exists='append', index=False)
+
+    # Ambil email yang sudah ada di dim
+    existing_emails = pd.read_sql(f"SELECT email FROM {table_name}", target_engine)['email'].str.lower().tolist()
+
+    # Filter data yang belum ada
+    df_filtered = df[~df['email'].str.lower().isin(existing_emails)].copy()
+
+    if df_filtered.empty:
+        print("✅ Tidak ada data baru untuk dimasukkan (semua sudah ada).")
+        return
+
+    print(f"✅ Memasukkan {len(df_filtered)} baris baru.")
+    df_filtered.to_sql(table_name, target_engine, if_exists='append', index=False)
+
 
 # === MAIN ===
 def run_etl_dosen_wali():
