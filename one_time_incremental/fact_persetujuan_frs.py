@@ -17,18 +17,51 @@ def extract_dim(name):
     print(f"[EXTRACT DIM] {name}")
     return pd.read_sql(f"SELECT * FROM {name}", target_engine)
 
-def get_max_id(table, col):
-    df = pd.read_sql(f"SELECT MAX({col}) AS max_id FROM {table}", target_engine)
-    return int(df['max_id'][0]) if df['max_id'][0] is not None else 0
+def get_max_waktu_date_from_fact():
+    """
+    Cari tanggal maksimum (date-only) yang sudah ada di fact_persetujuan_frs.
+    Caranya: Ambil max(waktu_persetujuan_id) lalu lookup di dim_waktu.
+    Jika belum ada row di fact, kembalikan None.
+    """
+    sql = """
+        SELECT f.waktu_persetujuan_id
+        FROM fact_persetujuan_frs AS f
+        ORDER BY f.waktu_persetujuan_id DESC
+        LIMIT 1
+    """
+    df = pd.read_sql(sql, target_engine)
+    if df.empty:
+        return None
+
+    max_waktu_id = int(df.at[0, 'waktu_persetujuan_id'])
+    # Sekarang ambil tanggal_date di dim_waktu untuk max_waktu_id
+    sql2 = f"""
+        SELECT tanggal AS tanggal_full
+        FROM dim_waktu
+        WHERE waktu_id = {max_waktu_id}
+        LIMIT 1
+    """
+    df2 = pd.read_sql(sql2, target_engine)
+    if df2.empty:
+        return None
+
+    # Normalize → ambil date saja
+    ts = pd.to_datetime(df2.at[0, 'tanggal_full']).normalize()
+    print(f"[WATERMARK] Last loaded tanggal_date di fact = {ts.date()}")
+    return ts
 
 # === TRANSFORM ===
-def transform(
+def transform_incremental(
     df_frs, df_mhs_raw, df_log, df_detail, df_kelas,
-    df_nilai, df_dim_mhs, df_dim_waktu
+    df_nilai, df_dim_mhs, df_dim_waktu, watermark_date
 ):
-    print("[TRANSFORM] fact_persetujuan_frs")
+    """
+    Sama seperti transform() sebelumnya, tapi cuma proses baris log_frs di atas watermark_date.
+    watermark_date: pd.Timestamp (date-only) atau None (jika full load).
+    """
+    print("[TRANSFORM-INC] fact_persetujuan_frs")
 
-    # 1) Format kolom NRP dan ubah log.tanggal → datetime
+    # 1) Format NRP dan ubah log.tanggal jadi datetime + buat tanggal_date
     df_frs['nrp']        = df_frs['nrp'].astype(str)
     df_mhs_raw['nrp']    = df_mhs_raw['nrp'].astype(str)
     df_nilai['nrp']      = df_nilai['nrp'].astype(str)
@@ -36,9 +69,24 @@ def transform(
     df_log['tanggal']    = pd.to_datetime(df_log['tanggal'])
     df_dim_waktu['tanggal'] = pd.to_datetime(df_dim_waktu['tanggal'])
 
-    # 2) Tambahkan kolom date‐only (strip jam, menit, detik)
     df_log['tanggal_date']      = df_log['tanggal'].dt.normalize()
     df_dim_waktu['tanggal_date'] = df_dim_waktu['tanggal'].dt.normalize()
+
+    # 2) Jika watermark_date tidak None, filter hanya log_frs setelah tanggal itu
+    if watermark_date is not None:
+        mask_new = df_log['tanggal_date'] > watermark_date
+        df_log = df_log[mask_new].copy()
+        print(f"[FILTER] Baris log_frs setelah {watermark_date.date()} = {len(df_log)}")
+        if df_log.empty:
+            print("[TRANSFORM-INC] Tidak ada data baru di log_frs → skip transform")
+            return pd.DataFrame(columns=[
+                'persetujuan_frs_id',
+                'mahasiswa_id',
+                'dosen_wali_id',
+                'waktu_persetujuan_id',
+                'is_frs_disetujui',
+                'jumlah_sks',
+            ])
 
     # 3) Merge untuk dapatkan mahasiswa_id & dosen_wali_id
     df = df_frs.merge(
@@ -49,25 +97,28 @@ def transform(
         on='nrp', how='left'
     )
 
-    # 4) Ambil log terakhir (per frs_id), sekaligus simpan tanggal_date
+    # 4) Ambil log terakhir *hanya untuk frs_id yang masuk df_log versi baru*
+    #    (df_log sudah berisi only new records)
     df_log_latest = (
         df_log
         .sort_values('tanggal')
         .drop_duplicates(subset='frs_id', keep='last')
         .rename(columns={'status': 'status_log'})
     )
-    # debug: cek beberapa tanggal_date unik di log dan di dim_waktu
-    print("[DEBUG] Unique tanggal_date di log_frs:", 
+    # debug: cek uniq tanggal_date (optional)
+    print("[DEBUG] Unique tanggal_date di log_frs (baru):", 
           df_log_latest['tanggal_date'].dt.strftime('%Y-%m-%d').unique()[:5], 
           "… total", df_log_latest['tanggal_date'].nunique())
     print("[DEBUG] Unique tanggal_date di dim_waktu:", 
           df_dim_waktu['tanggal_date'].dt.strftime('%Y-%m-%d').unique()[:5], 
           "… total", df_dim_waktu['tanggal_date'].nunique())
 
+    # Gabungkan log terbaru ke main df → tapi kita butuh data FR S‐nya
     df = df.merge(
         df_log_latest[['frs_id', 'status_log', 'tanggal_date']],
-        left_on='id', right_on='frs_id', how='left'
+        left_on='id', right_on='frs_id', how='inner'
     )
+    # catatan: pakai how='inner' supaya hanya FRS yang ada di df_log_latest
 
     # 5) Merge ke dim_waktu berdasarkan tanggal_date
     df = df.merge(
@@ -103,16 +154,22 @@ def transform(
     )
     df['jumlah_sks'] = df['jumlah_sks'].fillna(0).astype(int)
 
+    # 8) IPK default (tanpa perhitungan semester)
+    df['ipk_terakhir'] = 0
 
-    # 9) Filter baris yang berhasil match ke dim_waktu
-    #    (agar waktu_persetujuan_id tidak null)
+    # 9) Filter baris yang match ke dim_waktu (waktu_persetujuan_id must not null)
     df = df[df['waktu_persetujuan_id'].notna()]
 
-    # 10) Generate surrogate key persetujuan_frs_id
-    last_id = get_max_id('fact_persetujuan_frs', 'persetujuan_frs_id')
-    df['persetujuan_frs_id'] = range(last_id + 1, last_id + 1 + len(df))
+    # 10) Generate surrogate key (incremental)
+    last_id = get_max_waktu_date_from_fact()
+    # get_max_waktu_date_from_fact() sudah diambil di luar. Kita perlu ID, bukan tanggal.
+    # Kita bisa panggil lagi untuk ID langsung:
+    sql_max_id = "SELECT MAX(persetujuan_frs_id) AS last_id FROM fact_persetujuan_frs"
+    df_lastid = pd.read_sql(sql_max_id, target_engine)
+    prev_id = int(df_lastid.at[0, 'last_id']) if not df_lastid.empty and pd.notna(df_lastid.at[0, 'last_id']) else 0
+    df['persetujuan_frs_id'] = range(prev_id + 1, prev_id + 1 + len(df))
 
-    # 11) Pilih kolom final sesuai DDL
+    # 11) Pilih kolom final
     df_final = df[[
         'persetujuan_frs_id',
         'mahasiswa_id',
@@ -126,6 +183,9 @@ def transform(
 
 # === LOAD ===
 def load_table(df, table_name):
+    if df.empty:
+        print(f"[LOAD] {table_name} → tidak ada record baru (0 baris)")
+        return
     print(f"[LOAD] {table_name} → {len(df)} baris")
     df.to_sql(
         table_name,
@@ -134,9 +194,12 @@ def load_table(df, table_name):
         index=False
     )
 
-# === MAIN ETL ===
-def run_etl():
-    # Extract dari source OLTP
+# === MAIN ETL INCREMENTAL ===
+def run_etl_incremental():
+    # 1) Bentuk watermark_date dari fact
+    watermark_date = get_max_waktu_date_from_fact()  # pd.Timestamp (date-only) atau None
+
+    # 2) Extract semua source
     df_frs       = extract_table("frs")
     df_mhs_raw   = extract_table("mahasiswa")
     df_log       = extract_table("log_frs")
@@ -144,18 +207,18 @@ def run_etl():
     df_kelas     = extract_table("kelas")
     df_nilai     = extract_table("nilai_mahasiswa")
 
-    # Extract dimensi (OLAP)
+    # 3) Extract dimensi
     df_dim_mhs   = extract_dim("dim_mahasiswa")
     df_dim_waktu = extract_dim("dim_waktu")
 
-    # Transformasi
-    df_fact = transform(
+    # 4) Transform incremental
+    df_fact_new = transform_incremental(
         df_frs, df_mhs_raw, df_log, df_detail, df_kelas,
-        df_nilai, df_dim_mhs, df_dim_waktu
+        df_nilai, df_dim_mhs, df_dim_waktu, watermark_date
     )
 
-    # Load ke fact_persetujuan_frs
-    load_table(df_fact, 'fact_persetujuan_frs')
+    # 5) Load hasil incremental
+    load_table(df_fact_new, 'fact_persetujuan_frs')
 
 if __name__ == "__main__":
-    run_etl()
+    run_etl_incremental()
