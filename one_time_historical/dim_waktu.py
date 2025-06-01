@@ -7,7 +7,7 @@ import numpy as np
 # === CONFIGURATION ===
 password = getpass.getpass("Masukkan password: ")
 SOURCE_DB_URI = f'mysql+mysqlconnector://root:{password}@localhost/frs_paling_fix'
-TARGET_DB_URI = f'mysql+mysqlconnector://root:{password}@localhost/olap'
+TARGET_DB_URI = f'mysql+mysqlconnector://root:{password}@localhost/olap_frs
 
 source_engine = create_engine(SOURCE_DB_URI)
 target_engine = create_engine(TARGET_DB_URI)
