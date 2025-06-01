@@ -5,7 +5,7 @@ from sqlalchemy import create_engine
 # === CONFIGURATION ===
 password = getpass.getpass("Masukkan password: ")
 SOURCE_DB_URI = f'mysql+mysqlconnector://root:{password}@localhost/frs_paling_fix'
-TARGET_DB_URI = f'mysql+mysqlconnector://root:{password}@localhost/olap_frs
+TARGET_DB_URI = f'mysql+mysqlconnector://root:{password}@localhost/olap_frs'
 
 source_engine = create_engine(SOURCE_DB_URI)
 target_engine = create_engine(TARGET_DB_URI)
@@ -27,10 +27,10 @@ def transform_perubahan_kelas(df):
     df = df[['action']].drop_duplicates()
     df['status'] = df['action'].str.strip().str.capitalize()
 
-    last_id = get_max_surrogate('dim_status_perubahan_kelas', 'perubahan_kelas_id')
-    df['perubahan_kelas_id'] = range(last_id + 1, last_id + 1 + len(df))
+    last_id = get_max_surrogate('dim_status_perubahan_kelas', 'status_perubahan_kelas_id')
+    df['status_perubahan_kelas_id'] = range(last_id + 1, last_id + 1 + len(df))
 
-    return df[['perubahan_kelas_id', 'status']]
+    return df[['status_perubahan_kelas_id', 'status']]
 
 # === LOAD ===
 def load_table(df, table_name):

@@ -3,9 +3,9 @@ import pandas as pd
 from sqlalchemy import create_engine
 
 # === CONFIGURATION ===
-password = getpass.getpass("Masukkan password: ")
+password = ""
 SOURCE_DB_URI = f'mysql+mysqlconnector://root:{password}@localhost/frs_paling_fix'
-TARGET_DB_URI = f'mysql+mysqlconnector://root:{password}@localhost/olap_frs
+TARGET_DB_URI = f'mysql+mysqlconnector://root:{password}@localhost/olap_frs'
 
 source_engine = create_engine(SOURCE_DB_URI)
 target_engine = create_engine(TARGET_DB_URI)
